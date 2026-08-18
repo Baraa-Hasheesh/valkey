@@ -198,7 +198,6 @@ long long popcountScalar(void *s, long count) {
 long long popcountNEON(void *s, long n) {
     long long t = 0;
     uint8_t *p = (uint8_t *)s;
-    ;
     const uint8_t *e = p + n;
 
     /* Process 64-byte blocks using unrolled loop (4 x 16-byte vectors) */

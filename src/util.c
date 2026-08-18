@@ -403,7 +403,6 @@ int ull2string(char *dst, size_t dstlen, unsigned long long value) {
     /* Check length. */
     uint32_t length = digits10(value);
     if (length >= dstlen) goto err;
-    ;
 
     /* Null term. */
     uint32_t next = length - 1;
@@ -1013,7 +1012,7 @@ int ld2string(char *buf, size_t len, long double value, ld2string_mode mode) {
         case LD_STR_AUTO:
             l = snprintf(buf, len, "%.17Lg", value);
             if (l + 1 > len) goto err;
-            ; /* No room. */
+            /* No room. */
             break;
         case LD_STR_HEX:
             l = snprintf(buf, len, "%La", value);
