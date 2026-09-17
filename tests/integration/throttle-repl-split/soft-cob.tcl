@@ -86,7 +86,7 @@ start_server {tags {"throttle repl external:skip valgrind:skip"}} {
         for {set iter 0} {$iter < 100} {incr iter} {
         test {Throttling protects a replica above the soft COB limit} {
             setup_throttle_replication $primary $replica $primary_host $primary_port
-            $primary config set client-output-buffer-limit "replica [expr {1024 * 1024 * 1024}] [expr {1 * 1024 * 1024}] 0"
+            $primary config set client-output-buffer-limit "replica [expr {1024 * 1024 * 1024}] [expr {1 * 1024 * 1024}] 60"
 
             set writer [valkey_deferring_client]
             $writer CLIENT ID

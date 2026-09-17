@@ -86,6 +86,7 @@ start_server {tags {"throttle repl external:skip valgrind:skip"}} {
         for {set iter 0} {$iter < 100} {incr iter} {
         test {Throttling not protect a replica above the hard COB limit} {
             setup_throttle_replication $primary $replica $primary_host $primary_port
+            $primary config set client-output-buffer-limit "replica 10mb 1mb 60"
 
             set writer [valkey_deferring_client]
             $writer CLIENT ID
@@ -107,9 +108,6 @@ start_server {tags {"throttle repl external:skip valgrind:skip"}} {
                 resume_process $replica_pid
                 fail "throttler never began queueing clients"
             }
-
-            # tighten the hard limit, the following 100MB write blows past it.
-            $primary config set client-output-buffer-limit "replica 10mb 1mb 0"
 
             # Write 100MB total (100 x 1MB values). This is well above the 10mb
             # hard limit, so the replica will be disconnected.
