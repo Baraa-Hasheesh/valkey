@@ -1,0 +1,92 @@
+# TEMPORARY flake-hunting harness. Runs the two Valgrind configurations that
+# reported the slot-migration failures, ten times each, so a flake that shows up
+# in roughly one run out of five is very likely to appear at least once.
+#
+# This file is throwaway: delete it before opening the pull request.
+name: Flake hunt
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_target:
+        description: "test path passed to --single"
+        default: "tests/unit/cluster/slot-migration.tcl"
+      repetitions:
+        description: "how many times to run each configuration"
+        default: "10"
+  push:
+    branches:
+      - "test-failures/slot-migrations-ci"
+
+jobs:
+  # Mirrors daily.yml test-valgrind-test with matrix.shard = cluster.
+  test-valgrind-test-cluster:
+    name: valgrind-test-cluster (run ${{ matrix.run }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 1440
+    strategy:
+      fail-fast: false
+      matrix:
+        run: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install libbacktrace
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ianlancetaylor/libbacktrace
+          ref: b9e40069c0b47a722286b94eb5231f7f05c08713
+          path: libbacktrace
+      - run: cd libbacktrace && ./configure && make && sudo make install
+      - name: Install Zstandard
+        run: sudo apt-get update && sudo apt-get install -y libzstd-dev
+      - name: make
+        run: make valgrind SERVER_CFLAGS='-Werror' BUILD_ZSTD=yes USE_LIBBACKTRACE=yes
+      - name: testprep
+        run: |
+          sudo apt-get update
+          sudo apt-get install tcl8.6 tclx valgrind -y
+      - name: test
+        run: |
+          ./runtest --valgrind --no-latency --failures-output test-failures/valkey.json \
+            --verbose --clients 1 --timeout 2400 --dump-logs \
+            --single "${{ github.event.inputs.test_target || 'tests/unit/cluster/slot-migration.tcl' }}"
+      - name: Upload test failures
+        if: always()
+        uses: ./.github/actions/upload-test-failures
+        with:
+          job-name: ${{ github.job }}-run${{ matrix.run }}
+
+  # Mirrors daily.yml test-valgrind-no-malloc-usable-size-test with shard = cluster.
+  test-valgrind-no-malloc-usable-size-test-cluster:
+    name: valgrind-no-malloc-usable-size-cluster (run ${{ matrix.run }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 1440
+    strategy:
+      fail-fast: false
+      matrix:
+        run: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Install libbacktrace
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: ianlancetaylor/libbacktrace
+          ref: b9e40069c0b47a722286b94eb5231f7f05c08713
+          path: libbacktrace
+      - run: cd libbacktrace && ./configure && make && sudo make install
+      - name: make
+        run: make valgrind CFLAGS="-DNO_MALLOC_USABLE_SIZE" SERVER_CFLAGS='-Werror' USE_LIBBACKTRACE=yes
+      - name: testprep
+        run: |
+          sudo apt-get update
+          sudo apt-get install tcl8.6 tclx valgrind -y
+      - name: test
+        run: |
+          ./runtest --valgrind --no-latency --failures-output test-failures/valkey.json \
+            --verbose --clients 1 --timeout 2400 --dump-logs \
+            --single "${{ github.event.inputs.test_target || 'tests/unit/cluster/slot-migration.tcl' }}"
+      - name: Upload test failures
+        if: always()
+        uses: ./.github/actions/upload-test-failures
+        with:
+          job-name: ${{ github.job }}-run${{ matrix.run }}
