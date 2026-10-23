@@ -68,12 +68,14 @@ TEST_MODULES = \
     moduleauthtwo.so \
     rdbloadsave.so \
     crash.so \
+    loaderlock.so \
     cluster.so \
     hellovalkey.so \
     helloscripting.so \
     unsupported_features.so \
     deferred_reply.so \
-    pausetest.so
+    pausetest.so \
+    arenalock.so
 
 .PHONY: all
 
