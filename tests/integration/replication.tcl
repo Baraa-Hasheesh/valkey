@@ -2471,7 +2471,7 @@ start_server {tags {"repl external:skip tls:skip"} overrides {save {}}} {
 # iterator and cannot yet be served from the shared replication buffer. They
 # must still reach the replica (via the dedicated save buffer) or they are lost
 # -- the offsets converge but the replica is missing keys.
-start_server {tags {"repl external:skip"} overrides {save {} forkless-infrastructure-enabled yes forkless-policy prefer-forkless}} {
+start_server {tags {"repl external:skip valgrind:skip"} overrides {save {} forkless-infrastructure-enabled yes forkless-policy prefer-forkless}} {
     set primary [srv 0 client]
     set primary_host [srv 0 host]
     set primary_port [srv 0 port]
@@ -2754,7 +2754,7 @@ foreach kind {multi eval} {
 }
 
 foreach load_mode {disabled on-empty-db} {
-    start_server {tags {"repl external:skip"} overrides {save "" forkless-infrastructure-enabled yes}} {
+    start_server {tags {"repl external:skip valgrind:skip"} overrides {save "" forkless-infrastructure-enabled yes}} {
         set primary [srv 0 client]
         set primary_host [srv 0 host]
         set primary_port [srv 0 port]
