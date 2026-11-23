@@ -4,6 +4,7 @@
 
 #include "valkeymodule.h"
 
+#include <pthread.h>
 #include <string.h>
 
 static long long done = 0; /* the last SETALL/MULTISETALL timer finished */
@@ -18,6 +19,7 @@ typedef struct {
     ValkeyModuleString *value;
     long long count;
     int multi;
+    int call_between; /* ValkeyModule_Call a write between StringSet and Replicate */
 } setAllArgs;
 
 static void setAllTimer(ValkeyModuleCtx *ctx, void *data) {
@@ -38,6 +40,10 @@ static void setAllTimer(ValkeyModuleCtx *ctx, void *data) {
             } else {
                 ValkeyModule_StringSet(key, args->value);
                 ValkeyModule_CloseKey(key);
+                if (args->call_between) {
+                    ValkeyModuleCallReply *reply = ValkeyModule_Call(ctx, "INCR", "!c", "counter");
+                    if (reply) ValkeyModule_FreeCallReply(reply);
+                }
                 ValkeyModule_Replicate(ctx, "SET", "ss", k1, args->value);
                 set++;
             }
@@ -70,7 +76,7 @@ static void setAllTimer(ValkeyModuleCtx *ctx, void *data) {
     done = 1;
 }
 
-static int setAllCommandImpl(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc, int multi) {
+static int setAllCommandImpl(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc, int multi, int call_between) {
     if (argc != 4)
         return ValkeyModule_WrongArity(ctx);
     long long count;
@@ -82,6 +88,7 @@ static int setAllCommandImpl(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, in
     args->value = ValkeyModule_CreateStringFromString(NULL, argv[3]);
     args->count = count;
     args->multi = multi;
+    args->call_between = call_between;
     done = set = skipped = 0;
     ValkeyModule_CreateTimer(ctx, 1, setAllTimer, args);
     return ValkeyModule_ReplyWithSimpleString(ctx, "OK");
@@ -89,13 +96,185 @@ static int setAllCommandImpl(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, in
 
 /* FORKLESSTIMER.SETALL <prefix> <count> <value> */
 static int setAllCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
-    return setAllCommandImpl(ctx, argv, argc, 0);
+    return setAllCommandImpl(ctx, argv, argc, 0, 0);
 }
 
 /* FORKLESSTIMER.MULTISETALL <prefix> <count> <value>: pairs of keys, one MSET
  * each */
 static int multiSetAllCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
-    return setAllCommandImpl(ctx, argv, argc, 1);
+    return setAllCommandImpl(ctx, argv, argc, 1, 0);
+}
+
+/* FORKLESSTIMER.SETCALLALL <prefix> <count> <value>: like SETALL, but between
+ * each StringSet and its Replicate the timer runs INCR counter with
+ * ValkeyModule_Call */
+static int setCallAllCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    return setAllCommandImpl(ctx, argv, argc, 0, 1);
+}
+
+/* Pops the head of each <prefix><i> list and replicates the LPOP. Popping the
+ * last element deletes the key. */
+static void popAllTimer(ValkeyModuleCtx *ctx, void *data) {
+    setAllArgs *args = data;
+    size_t plen;
+    const char *prefix = ValkeyModule_StringPtrLen(args->prefix, &plen);
+    ValkeyModule_SelectDb(ctx, 0);
+    for (long long i = 0; i < args->count; i++) {
+        ValkeyModuleString *k =
+            ValkeyModule_CreateStringPrintf(ctx, "%.*s%lld", (int)plen, prefix, i);
+        ValkeyModuleKey *key = ValkeyModule_OpenKey(ctx, k, VALKEYMODULE_WRITE);
+        if (key == NULL) {
+            skipped++;
+        } else {
+            ValkeyModuleString *e = ValkeyModule_ListPop(key, VALKEYMODULE_LIST_HEAD);
+            ValkeyModule_CloseKey(key);
+            if (e) {
+                ValkeyModule_FreeString(ctx, e);
+                ValkeyModule_Replicate(ctx, "LPOP", "s", k);
+                set++;
+            }
+        }
+        ValkeyModule_FreeString(ctx, k);
+    }
+    ValkeyModule_FreeString(NULL, args->prefix);
+    ValkeyModule_Free(args);
+    done = 1;
+}
+
+/* FORKLESSTIMER.POPALL <prefix> <count> */
+static int popAllCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    if (argc != 3)
+        return ValkeyModule_WrongArity(ctx);
+    long long count;
+    if (ValkeyModule_StringToLongLong(argv[2], &count) != VALKEYMODULE_OK ||
+        count < 0)
+        return ValkeyModule_ReplyWithError(ctx, "ERR invalid count");
+    setAllArgs *args = ValkeyModule_Alloc(sizeof(*args));
+    args->prefix = ValkeyModule_CreateStringFromString(NULL, argv[1]);
+    args->value = NULL;
+    args->count = count;
+    args->multi = 0;
+    args->call_between = 0;
+    done = set = skipped = 0;
+    ValkeyModule_CreateTimer(ctx, 1, popAllTimer, args);
+    return ValkeyModule_ReplyWithSimpleString(ctx, "OK");
+}
+
+/* Deletes the field of each hash, so a hash with only that field is removed,
+ * and replicates the HDEL. */
+static void hdelAllTimer(ValkeyModuleCtx *ctx, void *data) {
+    setAllArgs *args = data;
+    size_t plen;
+    const char *prefix = ValkeyModule_StringPtrLen(args->prefix, &plen);
+    ValkeyModule_SelectDb(ctx, 0);
+    for (long long i = 0; i < args->count; i++) {
+        ValkeyModuleString *k =
+            ValkeyModule_CreateStringPrintf(ctx, "%.*s%lld", (int)plen, prefix, i);
+        ValkeyModuleKey *key = ValkeyModule_OpenKey(ctx, k, VALKEYMODULE_WRITE);
+        if (key == NULL) {
+            skipped++;
+        } else {
+            ValkeyModule_HashSet(key, VALKEYMODULE_HASH_NONE, args->value,
+                                 VALKEYMODULE_HASH_DELETE, NULL);
+            ValkeyModule_CloseKey(key);
+            ValkeyModule_Replicate(ctx, "HDEL", "ss", k, args->value);
+            set++;
+        }
+        ValkeyModule_FreeString(ctx, k);
+    }
+    ValkeyModule_FreeString(NULL, args->prefix);
+    ValkeyModule_FreeString(NULL, args->value);
+    ValkeyModule_Free(args);
+    done = 1;
+}
+
+/* FORKLESSTIMER.HDELALL <prefix> <count> <field> */
+static int hdelAllCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    if (argc != 4)
+        return ValkeyModule_WrongArity(ctx);
+    long long count;
+    if (ValkeyModule_StringToLongLong(argv[2], &count) != VALKEYMODULE_OK ||
+        count < 0)
+        return ValkeyModule_ReplyWithError(ctx, "ERR invalid count");
+    setAllArgs *args = ValkeyModule_Alloc(sizeof(*args));
+    args->prefix = ValkeyModule_CreateStringFromString(NULL, argv[1]);
+    args->value = ValkeyModule_CreateStringFromString(NULL, argv[3]);
+    args->count = count;
+    args->multi = 0;
+    args->call_between = 0;
+    done = set = skipped = 0;
+    ValkeyModule_CreateTimer(ctx, 1, hdelAllTimer, args);
+    return ValkeyModule_ReplyWithSimpleString(ctx, "OK");
+}
+
+typedef struct {
+    ValkeyModuleCtx *ctx; /* detached thread-safe context */
+    setAllArgs *args;
+} threadSetAllArgs;
+
+/* Writes every key from a module thread that holds the GIL, outside call(). */
+static void *threadSetAllWorker(void *data) {
+    threadSetAllArgs *targs = data;
+    ValkeyModuleCtx *ctx = targs->ctx;
+    setAllArgs *args = targs->args;
+    size_t plen;
+    const char *prefix = ValkeyModule_StringPtrLen(args->prefix, &plen);
+    ValkeyModule_ThreadSafeContextLock(ctx);
+    ValkeyModule_SelectDb(ctx, 0);
+    for (long long i = 0; i < args->count; i++) {
+        ValkeyModuleString *k =
+            ValkeyModule_CreateStringPrintf(ctx, "%.*s%lld", (int)plen, prefix, i);
+        ValkeyModuleKey *key = ValkeyModule_OpenKey(ctx, k, VALKEYMODULE_WRITE);
+        if (key == NULL) {
+            skipped++;
+        } else {
+            ValkeyModule_StringSet(key, args->value);
+            ValkeyModule_CloseKey(key);
+            ValkeyModule_Replicate(ctx, "SET", "ss", k, args->value);
+            set++;
+        }
+        ValkeyModule_FreeString(ctx, k);
+    }
+    ValkeyModule_FreeString(NULL, args->prefix);
+    ValkeyModule_FreeString(NULL, args->value);
+    ValkeyModule_Free(args);
+    done = 1;
+    ValkeyModule_ThreadSafeContextUnlock(ctx);
+    ValkeyModule_FreeThreadSafeContext(ctx);
+    ValkeyModule_Free(targs);
+    return NULL;
+}
+
+/* FORKLESSTIMER.THREADSETALL <prefix> <count> <value>: like SETALL, from a
+ * module thread with a thread-safe context instead of a timer. */
+static int threadSetAllCommand(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int argc) {
+    if (argc != 4)
+        return ValkeyModule_WrongArity(ctx);
+    long long count;
+    if (ValkeyModule_StringToLongLong(argv[2], &count) != VALKEYMODULE_OK ||
+        count < 0)
+        return ValkeyModule_ReplyWithError(ctx, "ERR invalid count");
+    setAllArgs *args = ValkeyModule_Alloc(sizeof(*args));
+    args->prefix = ValkeyModule_CreateStringFromString(NULL, argv[1]);
+    args->value = ValkeyModule_CreateStringFromString(NULL, argv[3]);
+    args->count = count;
+    args->multi = 0;
+    args->call_between = 0;
+    threadSetAllArgs *targs = ValkeyModule_Alloc(sizeof(*targs));
+    targs->ctx = ValkeyModule_GetDetachedThreadSafeContext(ctx);
+    targs->args = args;
+    done = set = skipped = 0;
+    pthread_t tid;
+    if (pthread_create(&tid, NULL, threadSetAllWorker, targs) != 0) {
+        ValkeyModule_FreeThreadSafeContext(targs->ctx);
+        ValkeyModule_FreeString(NULL, args->prefix);
+        ValkeyModule_FreeString(NULL, args->value);
+        ValkeyModule_Free(args);
+        ValkeyModule_Free(targs);
+        return ValkeyModule_ReplyWithError(ctx, "ERR failed to create thread");
+    }
+    pthread_detach(tid);
+    return ValkeyModule_ReplyWithSimpleString(ctx, "OK");
 }
 
 /* FORKLESSTIMER.STATS -> [done, set, skipped] */
@@ -182,6 +361,20 @@ int ValkeyModule_OnLoad(ValkeyModuleCtx *ctx, ValkeyModuleString **argv, int arg
         return VALKEYMODULE_ERR;
     if (ValkeyModule_CreateCommand(ctx, "forklesstimer.multisetall",
                                    multiSetAllCommand, "readonly", 0, 0,
+                                   0) == VALKEYMODULE_ERR)
+        return VALKEYMODULE_ERR;
+    if (ValkeyModule_CreateCommand(ctx, "forklesstimer.popall", popAllCommand,
+                                   "readonly", 0, 0, 0) == VALKEYMODULE_ERR)
+        return VALKEYMODULE_ERR;
+    if (ValkeyModule_CreateCommand(ctx, "forklesstimer.hdelall", hdelAllCommand,
+                                   "readonly", 0, 0, 0) == VALKEYMODULE_ERR)
+        return VALKEYMODULE_ERR;
+    if (ValkeyModule_CreateCommand(ctx, "forklesstimer.threadsetall",
+                                   threadSetAllCommand, "readonly", 0, 0,
+                                   0) == VALKEYMODULE_ERR)
+        return VALKEYMODULE_ERR;
+    if (ValkeyModule_CreateCommand(ctx, "forklesstimer.setcallall",
+                                   setCallAllCommand, "readonly", 0, 0,
                                    0) == VALKEYMODULE_ERR)
         return VALKEYMODULE_ERR;
     if (ValkeyModule_CreateCommand(ctx, "forklesstimer.stats", statsCommand,

@@ -3804,8 +3804,8 @@ int VM_ReplyWithLongDouble(ValkeyModuleCtx *ctx, long double ld) {
  * Outside of a command (timers, callbacks) during a forkless full sync, a
  * command without keys is always replicated. A command with keys is replicated
  * if the sync already sent all of them, and not if it sent none (the sync sends
- * their new values later). If it sent only some of them, the sync of that
- * replica is terminated and the replica syncs again, so a module should not
+ * their new values later). If it sent only some of them, the forkless sync is
+ * terminated and all of its replicas sync again, so a module should not
  * replicate one command over keys the sync may reach at different times.
  *
  * #### Note about calling this function from a thread safe context:

@@ -356,6 +356,41 @@ struct genericIterator {
 };
 
 
+// An expedited key deleted by a module write outside call() (see bgIterator.module_early_deleted_keys)
+typedef struct moduleEarlyDeletedKey {
+    int dbid;
+    sds key;
+} moduleEarlyDeletedKey;
+
+static void freeModuleEarlyDeletedKey(void *ptr) {
+    moduleEarlyDeletedKey *k = ptr;
+    sdsfree(k->key);
+    zfree(k);
+}
+
+// The entry is its own key: (dbid, key)
+static const void *moduleEarlyDeletedKeyGetKey(const void *entry) {
+    return entry;
+}
+
+static uint64_t moduleEarlyDeletedKeyHash(const void *key) {
+    const moduleEarlyDeletedKey *k = key;
+    return hashtableGenHashFunction(k->key, sdslen(k->key)) ^ (uint64_t)k->dbid;
+}
+
+// Non-zero when the keys are equal (hashtable's keyCompare convention)
+static int moduleEarlyDeletedKeyCompare(const void *key1, const void *key2) {
+    const moduleEarlyDeletedKey *k1 = key1, *k2 = key2;
+    return k1->dbid == k2->dbid && sdscmp(k1->key, k2->key) == 0;
+}
+
+static hashtableType moduleEarlyDeletedKeyHashtableType = {
+    .entryGetKey = moduleEarlyDeletedKeyGetKey,
+    .hashFunction = moduleEarlyDeletedKeyHash,
+    .keyCompare = moduleEarlyDeletedKeyCompare,
+    .entryDestructor = freeModuleEarlyDeletedKey};
+
+
 /* This struct is used across threads.  Unless otherwise noted, the fields are initialized at
  *  iterator creation (within the main thread) and are read-only by the client thread. */
 struct bgIterator {
@@ -404,11 +439,13 @@ struct bgIterator {
      * to avoid a dangling pointer.  This flag records if the entry was in early_iterate_entries. */
     bool last_key_delete_was_early; // Used only in main thread during command processing
 
-    /* Keys (robj) that were expedited (in early_iterate_entries) and then deleted by a module write
-     * outside call().  A module that deletes and re-creates such a key (e.g. VM_StringSet) gets a
-     * new dbEntry that must be treated as early too.  Used only in main thread.  Created lazily,
-     * cleared when the next command starts and after the module propagation is processed. */
-    list *module_early_deleted_keys;
+    /* Keys (moduleEarlyDeletedKey) that were expedited (in early_iterate_entries) and then deleted
+     * by a module write outside call().  A module that deletes and re-creates such a key (e.g.
+     * VM_StringSet) gets a new dbEntry that must be treated as early too, and a module write that
+     * deletes such a key must still be replicated.  Used only in main thread.  Created lazily,
+     * cleared when the next top-level command starts and after the module propagation is
+     * processed (not by a module's nested ValkeyModule_Call or other propagation in between). */
+    hashtable *module_early_deleted_keys;
     unsigned long added_since_feed; // Items queued outside of feedIterator since its last call
 
     // Variables maintaining runtime statistics
@@ -952,7 +989,7 @@ static void bgIteratorRelease(bgIterator *it) {
     hashtableRelease(it->early_iterate_entries);
     it->early_iterate_entries = NULL;
 
-    if (it->module_early_deleted_keys) listRelease(it->module_early_deleted_keys);
+    if (it->module_early_deleted_keys) hashtableRelease(it->module_early_deleted_keys);
     it->module_early_deleted_keys = NULL;
 
     sdsfree(it->name);
@@ -1802,8 +1839,12 @@ static void resetReplicationFlagForIterators(client *c) {
     listRewind(allIterators, &li);
     while ((node = listNext(&li)) != NULL) {
         bgIterator *it = listNodeValue(node);
-        // Module early-deleted keys only apply to the module write that deleted them
-        if (it->module_early_deleted_keys) listEmpty(it->module_early_deleted_keys);
+        /* Module early-deleted keys only apply to the module write that deleted them.  A write
+         * ValkeyModule_Call from a module timer also gets here (before call() enters its execution
+         * unit), in the middle of the module's write, so only a top-level command clears them. */
+        if (server.execution_nesting == 0 && it->module_early_deleted_keys) {
+            hashtableEmpty(it->module_early_deleted_keys, NULL);
+        }
         if (it->completed || it->terminated) {
             it->cur_cmd_may_replicate = false;
         } else {
@@ -2352,10 +2393,15 @@ void bgIteration_keyDelete(int dbid, const_sds key) {
          * propagation is processed (see bgIteration_handleModuleEarlyDeletedKeys). */
         if (it->last_key_delete_was_early && !server.in_call) {
             if (it->module_early_deleted_keys == NULL) {
-                it->module_early_deleted_keys = listCreate();
-                listSetFreeMethod(it->module_early_deleted_keys, decrRefCountVoid);
+                it->module_early_deleted_keys = hashtableCreate(&moduleEarlyDeletedKeyHashtableType);
             }
-            listAddNodeTail(it->module_early_deleted_keys, createObject(OBJ_STRING, sdsdup(key)));
+            moduleEarlyDeletedKey probe = {.dbid = dbid, .key = (sds)key};
+            if (!hashtableFind(it->module_early_deleted_keys, &probe, NULL)) {
+                moduleEarlyDeletedKey *k = zmalloc(sizeof(*k));
+                k->dbid = dbid;
+                k->key = sdsdup(key);
+                hashtableAdd(it->module_early_deleted_keys, k);
+            }
         }
     }
 
@@ -2499,19 +2545,50 @@ bool bgIteration_blockClientIfRequired(client *c) {
  * clone of the old entry was already queued, and the module's replication of the write covers the
  * new value.  So the new dbEntry is treated as early: the scan must not send it a second time. */
 static void handleModuleEarlyDeletedKeys(bgIterator *it, int dbid) {
-    if (it->module_early_deleted_keys == NULL) return;
+    if (it->module_early_deleted_keys == NULL || hashtableSize(it->module_early_deleted_keys) == 0) return;
 
-    listIter li;
-    listNode *node;
-    listRewind(it->module_early_deleted_keys, &li);
-    while ((node = listNext(&li)) != NULL) {
-        robj *oKey = listNodeValue(node);
-        sds key = objectGetVal(oKey);
+    hashtableIterator iter;
+    void *entry;
+    hashtableInitIterator(&iter, it->module_early_deleted_keys, 0);
+    while (hashtableNext(&iter, &entry)) {
+        moduleEarlyDeletedKey *k = entry;
+        if (k->dbid != dbid) continue;
+        sds key = k->key;
         if (!it->keyset_iter->isKeyInScope(it->keyset_iter, key)) continue;
         dbEntry *de = dbFind(server.db[dbid], key);
         if (de == NULL || hashtableFind(it->early_iterate_entries, de, NULL)) continue;
         bool wasAdded = hashtableAdd(it->early_iterate_entries, de);
         serverAssert(wasAdded);
+    }
+    hashtableCleanupIterator(&iter);
+}
+
+
+/* True if a module write outside call() deleted this key after it was expedited.  The replica holds
+ * the early copy, and the scan will not visit the key again, so a write that leaves the key absent
+ * must be replicated as if the key were already passed. */
+static bool isModuleEarlyDeletedKey(bgIterator *it, int dbid, const_sds key) {
+    if (it->module_early_deleted_keys == NULL) return false;
+    moduleEarlyDeletedKey probe = {.dbid = dbid, .key = (sds)key};
+    return hashtableFind(it->module_early_deleted_keys, &probe, NULL);
+}
+
+
+/* A DEL or HDEL that is not a module propagation (active expiry, eviction, a lazy expiry in the
+ * middle of a module write) has decided the deleted keys itself.  Forget their early-deleted
+ * records, so they do not linger until a later module write finds them stale.  Records of other
+ * keys stay: they belong to a module write that has not replicated yet. */
+static void forgetModuleEarlyDeletedKeys(bgIterator *it,
+                                         int dbid,
+                                         struct serverCommand *cmd,
+                                         int argc,
+                                         robj **argv) {
+    if (it->module_early_deleted_keys == NULL || hashtableSize(it->module_early_deleted_keys) == 0) return;
+    // DEL/UNLINK name every key in argv[1..]; HDEL names one key in argv[1]
+    int last = isDeleteCmd(cmd) ? argc - 1 : 1;
+    for (int j = 1; j <= last && j < argc; j++) {
+        moduleEarlyDeletedKey probe = {.dbid = dbid, .key = objectGetVal(argv[j])};
+        hashtableDelete(it->module_early_deleted_keys, &probe);
     }
 }
 
@@ -2666,7 +2743,6 @@ void bgIteration_handleCommandReplication(int dbid,
         if (!(it->iteration_flags & BGITERATOR_FLAG_REPLICATION)) continue;
 
         if (modulePropagation) handleModuleEarlyDeletedKeys(it, dbid);
-        if (it->module_early_deleted_keys) listEmpty(it->module_early_deleted_keys);
 
         bool replicate = false;
         if (useReplicationFlags) replicate = it->cur_cmd_may_replicate;
@@ -2737,11 +2813,15 @@ void bgIteration_handleCommandReplication(int dbid,
          * Like a DEL, decide by the key's state: replicate if the iterator has already passed the
          * key (or sent it early).  Otherwise the iterator will send the key later in its current
          * state, which already reflects the expired fields.  Unlike a DEL, the key usually still
-         * exists here (the final HDEL is followed by a real DEL, handled above). */
+         * exists here (the final HDEL is followed by a real DEL, handled above).  A module that
+         * deletes the last field of an expedited hash removes the key before it replicates HDEL,
+         * so an absent key that a module write deleted early counts as passed. */
         if (!replicate && cmd->proc == hdelCommand) {
             sds key = objectGetVal(argv[1]);
+            dbEntry *hde = dbFind(server.db[dbid], key);
             if (it->keyset_iter->isKeyInScope(it->keyset_iter, key) &&
-                iteratorHasPassedKey(it, dbid, key, dbFind(server.db[dbid], key))) {
+                (iteratorHasPassedKey(it, dbid, key, hde) ||
+                 (hde == NULL && isModuleEarlyDeletedKey(it, dbid, key)))) {
                 replicate = true;
             }
         }
@@ -2764,7 +2844,11 @@ void bgIteration_handleCommandReplication(int dbid,
                     sds key = objectGetVal(argv[modResult.keys[j].pos]);
                     if (!it->keyset_iter->isKeyInScope(it->keyset_iter, key)) continue;
                     anyInScope = true;
-                    if (iteratorHasPassedKey(it, dbid, key, dbFind(server.db[dbid], key))) {
+                    /* A key the module write deleted after it was expedited is gone now, so only
+                     * the early-deleted record shows that the replica holds its early copy. */
+                    dbEntry *kde = dbFind(server.db[dbid], key);
+                    if (iteratorHasPassedKey(it, dbid, key, kde) ||
+                        (kde == NULL && isModuleEarlyDeletedKey(it, dbid, key))) {
                         anyPassed = true;
                     } else {
                         allPassed = false;
@@ -2785,6 +2869,15 @@ void bgIteration_handleCommandReplication(int dbid,
                 }
             }
             getKeysFreeResult(&modResult);
+        }
+
+        /* The module propagation has consumed the early-deleted keys.  Other propagation (a lazy
+         * expiry DEL, a nested ValkeyModule_Call) between the module's write and its replicate
+         * must not clear them. */
+        if (modulePropagation && it->module_early_deleted_keys) {
+            hashtableEmpty(it->module_early_deleted_keys, NULL);
+        } else if (isDeleteCmd(cmd) || cmd->proc == hdelCommand) {
+            forgetModuleEarlyDeletedKeys(it, dbid, cmd, argc, argv);
         }
 
         if (replicate) {
