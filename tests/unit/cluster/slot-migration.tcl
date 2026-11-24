@@ -341,7 +341,11 @@ proc create_empty_shard {p r} {
 # until it is a primary again. $observer never sees $primary as a replica, so
 # the newer config epoch is the only sign it gets that $primary is the primary
 # of the shard again.
-proc failover_and_back_unseen_by {primary replica observer} {
+#
+# With $handshake, that config epoch first reaches $observer in the PONG that
+# answers a MEET. $observer knows $primary already, so it discards the packet.
+proc failover_and_back_unseen_by {primary replica observer {handshake 0}} {
+    set CLUSTER_PACKET_TYPE_PING 0
     set CLUSTER_PACKET_TYPE_NONE -1
     set CLUSTER_PACKET_TYPE_ALL -2
     set primary_id [R $primary CLUSTER MYID]
@@ -376,7 +380,37 @@ proc failover_and_back_unseen_by {primary replica observer} {
         fail "R $primary didn't take over from R $replica in time"
     }
 
+    # Once the other nodes have seen $primary take over, $observer has dropped
+    # what $primary sent it as a replica.
+    set primary_epoch [dict get [cluster_get_myself $primary] config_epoch]
+    for {set j 0} {$j < [llength $::servers]} {incr j} {
+        if {$j == $observer} continue
+        wait_for_condition 100 100 {
+            [cluster_has_flag [cluster_get_node_by_id $j $primary_id] master] &&
+            [dict get [cluster_get_node_by_id $j $primary_id] config_epoch] == $primary_epoch
+        } else {
+            fail "R $j didn't see R $primary take over from R $replica in time"
+        }
+    }
     assert {[cluster_has_flag [cluster_get_node_by_id $observer $primary_id] master]}
+
+    if {$handshake} {
+        # The ping of $observer to $primary must be pending, so that the PONG
+        # of the handshake link is the only one $primary sends it.
+        wait_for_condition 100 100 {
+            [dict get [cluster_get_node_by_id $observer $primary_id] ping_sent] != 0
+        } else {
+            fail "R $observer has no pending ping to R $primary"
+        }
+        set loglevel [lindex [R $observer CONFIG GET loglevel] 1]
+        R $observer CONFIG SET loglevel verbose
+        set loglines [count_log_lines [expr -1*$observer]]
+        R $observer DEBUG DROP-CLUSTER-PACKET-FILTER $CLUSTER_PACKET_TYPE_PING
+        assert_equal {OK} [R $observer CLUSTER MEET [srv [expr -1*$primary] host] [srv [expr -1*$primary] port]]
+        wait_for_log_messages [expr -1*$observer] [list "*Handshake: we already know node $primary_id*"] $loglines 100 100
+        R $observer CONFIG SET loglevel $loglevel
+    }
+
     lassign [R $observer TIME] sec usec
     set now [expr {$sec * 1000 + $usec / 1000}]
     R $observer DEBUG DROP-CLUSTER-PACKET-FILTER $CLUSTER_PACKET_TYPE_NONE
@@ -472,6 +506,19 @@ start_cluster 3 5 {tags {external:skip cluster} overrides {cluster-allow-replica
         test_defer_fail { normalize_cluster $shard_pairs }
         # R3 sees the failover from R6 to R7, but not the one back to R6
         failover_and_back_unseen_by 6 7 3
+        wait_for_role 6 master
+        wait_for_role 7 slave
+        # Validate final states
+        wait_for_slot_state 0 "\[609->-$R6_id\]"
+        wait_for_slot_state 6 "\[609-<-$R0_id\]"
+        wait_for_slot_state 3 "\[609->-$R6_id\]"
+        wait_for_slot_state 7 "\[609-<-$R0_id\]"
+    }
+
+    test "Empty-shard migration target is auto-updated after a newer config epoch first seen on a handshake link" {
+        test_defer_fail { normalize_cluster $shard_pairs }
+        # R3 misses both failovers and discards the first PONG of R6 after them
+        failover_and_back_unseen_by 6 7 3 1
         wait_for_role 6 master
         wait_for_role 7 slave
         # Validate final states

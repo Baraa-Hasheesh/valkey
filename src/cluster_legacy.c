@@ -4299,8 +4299,14 @@ int clusterProcessPacket(clusterLink *link) {
         sender_claimed_config_epoch = ntohu64(msg->configEpoch);
         if (sender_claimed_current_epoch > server.cluster->currentEpoch)
             server.cluster->currentEpoch = sender_claimed_current_epoch;
-        /* Update the sender configEpoch if it is a primary publishing a newer one. */
-        if (sender_claims_to_be_primary && sender_claimed_config_epoch > sender->configEpoch) {
+        /* Update the sender configEpoch if it is a primary publishing a newer one.
+         *
+         * A packet from a known node on a handshake link is discarded below,
+         * before the slot config checks that a newer configEpoch can trigger.
+         * Leave the configEpoch to the next packet of the node, so that the
+         * trigger is not lost. */
+        int on_handshake_link = !link->inbound && nodeInHandshake(link->node);
+        if (sender_claims_to_be_primary && sender_claimed_config_epoch > sender->configEpoch && !on_handshake_link) {
             sender->configEpoch = sender_claimed_config_epoch;
             sender_published_newer_epoch = 1;
             clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG | CLUSTER_TODO_FSYNC_CONFIG);
