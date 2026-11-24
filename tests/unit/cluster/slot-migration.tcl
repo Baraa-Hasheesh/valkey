@@ -111,6 +111,19 @@ proc node_seen_healthy_by_all {node_id} {
     return 1
 }
 
+# Returns 1 when every node in the cluster sees $node_id as a replica.
+proc node_seen_as_replica_by_all {node_id} {
+    for {set j 0} {$j < [llength $::servers]} {incr j} {
+        set node [cluster_get_node_by_id $j $node_id]
+        # A node turned into an empty node no longer knows the whole cluster.
+        if {$node eq {}} continue
+        if {![cluster_has_flag $node slave]} {
+            return 0
+        }
+    }
+    return 1
+}
+
 # Give the shard back to $primary with a manual failover.
 proc failback {primary} {
     set primary_id [R $primary CLUSTER MYID]
@@ -118,6 +131,14 @@ proc failback {primary} {
         [node_seen_healthy_by_all $primary_id] == 1
     } else {
         fail "node $primary_id is still flagged as failing by some node"
+    }
+    # A node can process a packet that $primary sent as a primary after the
+    # one that announced its replica role, and then sees it as a primary until
+    # its next packet. Such a node ignores its MFSTART or denies it the vote.
+    wait_for_condition 100 100 {
+        [node_seen_as_replica_by_all $primary_id] == 1
+    } else {
+        fail "node $primary_id is still seen as a primary by some node"
     }
     assert_equal {OK} [R $primary cluster failover]
     wait_for_role $primary master
@@ -315,6 +336,67 @@ proc create_empty_shard {p r} {
     wait_for_role $p master
 }
 
+# Fail over from $primary to $replica and back, while $observer drops every
+# cluster bus packet from the moment $primary is about to turn into a replica
+# until it is a primary again. $observer never sees $primary as a replica, so
+# the newer config epoch is the only sign it gets that $primary is the primary
+# of the shard again.
+proc failover_and_back_unseen_by {primary replica observer} {
+    set CLUSTER_PACKET_TYPE_NONE -1
+    set CLUSTER_PACKET_TYPE_ALL -2
+    set primary_id [R $primary CLUSTER MYID]
+    set replica_id [R $replica CLUSTER MYID]
+
+    # Freeze $primary until $observer has seen $replica take its shard over.
+    # A takeover needs no vote, so the nodes don't have to detect a failure.
+    pause_process [srv [expr -1*$primary] pid]
+    set wait_error [catch {
+        assert_equal {OK} [R $replica CLUSTER FAILOVER TAKEOVER]
+        wait_for_condition 100 100 {
+            [cluster_has_flag [cluster_get_node_by_id $observer $replica_id] master]
+        } else {
+            fail "R $observer didn't see R $replica take over from R $primary in time"
+        }
+        R $observer DEBUG DROP-CLUSTER-PACKET-FILTER $CLUSTER_PACKET_TYPE_ALL
+    } wait_result wait_options]
+    resume_process [srv [expr -1*$primary] pid]
+    if {$wait_error} {
+        return -options $wait_options $wait_result
+    }
+
+    wait_for_condition 100 100 {
+        [get_cluster_role $primary] eq "slave"
+    } else {
+        fail "R $primary didn't become a replica of R $replica in time"
+    }
+    assert_equal {OK} [R $primary CLUSTER FAILOVER TAKEOVER]
+    wait_for_condition 100 100 {
+        [get_cluster_role $primary] eq "master"
+    } else {
+        fail "R $primary didn't take over from R $replica in time"
+    }
+
+    assert {[cluster_has_flag [cluster_get_node_by_id $observer $primary_id] master]}
+    lassign [R $observer TIME] sec usec
+    set now [expr {$sec * 1000 + $usec / 1000}]
+    R $observer DEBUG DROP-CLUSTER-PACKET-FILTER $CLUSTER_PACKET_TYPE_NONE
+
+    # The pings sent to and by $observer in the meantime are still pending.
+    # Wait for a newer PONG in both directions, so that a lower
+    # cluster-node-timeout in a later test does not turn them into a failure.
+    set observer_id [R $observer CLUSTER MYID]
+    for {set j 0} {$j < [llength $::servers]} {incr j} {
+        if {$j == $observer} continue
+        set node_id [R $j CLUSTER MYID]
+        wait_for_condition 100 100 {
+            [dict get [cluster_get_node_by_id $j $observer_id] pong_recv] > $now &&
+            [dict get [cluster_get_node_by_id $observer $node_id] pong_recv] > $now
+        } else {
+            fail "R $observer and R $j didn't exchange a PONG in time"
+        }
+    }
+}
+
 start_cluster 3 5 {tags {external:skip cluster} overrides {cluster-allow-replica-migration no cluster-node-timeout 5000} } {
 
     set R0_id [R 0 CLUSTER MYID]
@@ -379,6 +461,32 @@ start_cluster 3 5 {tags {external:skip cluster} overrides {cluster-allow-replica
         wait_for_slot_state 7 "\[609-<-$R3_id\]"
         # Restore R0's primaryship
         failback 0
+        # Validate final states
+        wait_for_slot_state 0 "\[609->-$R6_id\]"
+        wait_for_slot_state 6 "\[609-<-$R0_id\]"
+        wait_for_slot_state 3 "\[609->-$R6_id\]"
+        wait_for_slot_state 7 "\[609-<-$R0_id\]"
+    }
+
+    test "Empty-shard migration target is auto-updated after a failover seen only as a newer config epoch" {
+        test_defer_fail { normalize_cluster $shard_pairs }
+        # R3 sees the failover from R6 to R7, but not the one back to R6
+        failover_and_back_unseen_by 6 7 3
+        wait_for_role 6 master
+        wait_for_role 7 slave
+        # Validate final states
+        wait_for_slot_state 0 "\[609->-$R6_id\]"
+        wait_for_slot_state 6 "\[609-<-$R0_id\]"
+        wait_for_slot_state 3 "\[609->-$R6_id\]"
+        wait_for_slot_state 7 "\[609-<-$R0_id\]"
+    }
+
+    test "Empty-shard primary follows a new primary seen only as a newer config epoch" {
+        test_defer_fail { normalize_cluster $shard_pairs }
+        # R7 takes the shard over from R6, but does not see R6 take it back
+        failover_and_back_unseen_by 6 7 7
+        wait_for_role 6 master
+        wait_for_role 7 slave
         # Validate final states
         wait_for_slot_state 0 "\[609->-$R6_id\]"
         wait_for_slot_state 6 "\[609-<-$R0_id\]"

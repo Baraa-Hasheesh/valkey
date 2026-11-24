@@ -4228,6 +4228,7 @@ int clusterProcessPacket(clusterLink *link) {
     int sender_claims_to_be_primary = !memcmp(msg->replicaof, CLUSTER_NODE_NULL_NAME, CLUSTER_NAMELEN);
     int sender_last_reported_as_replica = sender && nodeIsReplica(sender);
     int sender_last_reported_as_primary = sender && nodeIsPrimary(sender);
+    int sender_published_newer_epoch = 0;
 
     /* We store this information at the link layer so that we can send extensions
      * during the handshake even if we don't know the sender. */
@@ -4293,6 +4294,7 @@ int clusterProcessPacket(clusterLink *link) {
         /* Update the sender configEpoch if it is a primary publishing a newer one. */
         if (sender_claims_to_be_primary && sender_claimed_config_epoch > sender->configEpoch) {
             sender->configEpoch = sender_claimed_config_epoch;
+            sender_published_newer_epoch = 1;
             clusterDoBeforeSleep(CLUSTER_TODO_SAVE_CONFIG | CLUSTER_TODO_FSYNC_CONFIG);
 
             if (server.cluster->failover_auth_time && server.cluster->failover_auth_sent &&
@@ -4737,10 +4739,18 @@ int clusterProcessPacket(clusterLink *link) {
         /* Many checks are only needed if the set of served slots this
          * instance claims is different compared to the set of slots we have
          * for it or if there was a failover in the sender's shard. Check
-         * this ASAP to avoid other computational expensive checks later.*/
+         * this ASAP to avoid other computational expensive checks later.
+         *
+         * A failover in a shard that owns no slots changes no slot claim, and
+         * we may already see the sender as a primary: its replica role was
+         * never reported to us, or a stale packet it sent before it turned
+         * into a replica reverted that role. A newer configEpoch is then the
+         * only sign of the failover, so for a primary without slots it also
+         * triggers the checks. */
 
         if (sender && sender_claims_to_be_primary &&
-            (sender_last_reported_as_replica || memcmp(sender->slots, msg->myslots, sizeof(msg->myslots)))) {
+            (sender_last_reported_as_replica || (sender_published_newer_epoch && sender->numslots == 0) ||
+             memcmp(sender->slots, msg->myslots, sizeof(msg->myslots)))) {
             /* Make sure CLUSTER_NODE_PRIMARY has already been set by now on sender */
             serverAssert(nodeIsPrimary(sender));
 
