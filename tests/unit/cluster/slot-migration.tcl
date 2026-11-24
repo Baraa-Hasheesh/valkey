@@ -336,15 +336,43 @@ proc create_empty_shard {p r} {
     wait_for_role $p master
 }
 
+# Returns 1 when R<from>'s outbound link to the node was created after the last
+# PONG R<from> got from it. Until that PONG, R<from> sends full-header PUBLISH
+# messages on the link, which carry its config epoch.
+proc link_unsettled {from to_id} {
+    set link {}
+    foreach l [R $from CLUSTER LINKS] {
+        if {[dict get $l node] eq $to_id && [dict get $l direction] eq "to"} { set link $l }
+    }
+    if {$link eq {}} { return 0 }
+    set pong [dict get [cluster_get_node_by_id $from $to_id] pong_recv]
+    return [expr {[dict get $link create-time] > $pong}]
+}
+
+# Returns the shard id that R<idx> records for the node, from CLUSTER SHARDS.
+proc node_shard_id {idx node_id} {
+    foreach shard [R $idx CLUSTER SHARDS] {
+        foreach n [dict get $shard nodes] {
+            if {[dict get $n id] eq $node_id} { return [dict get $shard id] }
+        }
+    }
+    return {}
+}
+
 # Fail over from $primary to $replica and back, while $observer drops every
 # cluster bus packet from the moment $primary is about to turn into a replica
 # until it is a primary again. $observer never sees $primary as a replica, so
 # the newer config epoch is the only sign it gets that $primary is the primary
 # of the shard again.
 #
-# With $handshake, that config epoch first reaches $observer in the PONG that
-# answers a MEET. $observer knows $primary already, so it discards the packet.
-proc failover_and_back_unseen_by {primary replica observer {handshake 0}} {
+# $first_seen chooses the packet that first carries that config epoch to
+# $observer:
+# - ping: a regular PING or PONG.
+# - handshake: the PONG that answers a MEET. $observer knows $primary already,
+#   so it discards the packet.
+# - publish: a full-header PUBLISH, sent before $primary's first PONG on a new
+#   link to $observer. Only PINGs and PONGs reach the slot checks.
+proc failover_and_back_unseen_by {primary replica observer {first_seen ping}} {
     set CLUSTER_PACKET_TYPE_PING 0
     set CLUSTER_PACKET_TYPE_NONE -1
     set CLUSTER_PACKET_TYPE_ALL -2
@@ -394,7 +422,7 @@ proc failover_and_back_unseen_by {primary replica observer {handshake 0}} {
     }
     assert {[cluster_has_flag [cluster_get_node_by_id $observer $primary_id] master]}
 
-    if {$handshake} {
+    if {$first_seen eq "handshake"} {
         # The ping of $observer to $primary must be pending, so that the PONG
         # of the handshake link is the only one $primary sends it.
         wait_for_condition 100 100 {
@@ -409,6 +437,26 @@ proc failover_and_back_unseen_by {primary replica observer {handshake 0}} {
         assert_equal {OK} [R $observer CLUSTER MEET [srv [expr -1*$primary] host] [srv [expr -1*$primary] port]]
         wait_for_log_messages [expr -1*$observer] [list "*Handshake: we already know node $primary_id*"] $loglines 100 100
         R $observer CONFIG SET loglevel $loglevel
+    }
+
+    if {$first_seen eq "publish"} {
+        # $observer dropped every packet long enough for $primary to reconnect
+        # its link to $observer, so that link has not seen a PONG yet.
+        set observer_id [R $observer CLUSTER MYID]
+        wait_for_condition 300 100 {
+            [link_unsettled $primary $observer_id]
+        } else {
+            fail "R $primary link to R $observer never became unsettled"
+        }
+        set sub [valkey_deferring_client [expr -1*$observer]]
+        $sub subscribe first-epoch-ch
+        $sub read
+        R $observer DEBUG DROP-CLUSTER-PACKET-FILTER $CLUSTER_PACKET_TYPE_PING
+        R $primary PUBLISH first-epoch-ch hello
+        assert_equal {message first-epoch-ch hello} [$sub read]
+        $sub close
+        # The full-header PUBLISH recorded the newer config epoch.
+        assert_equal $primary_epoch [dict get [cluster_get_node_by_id $observer $primary_id] config_epoch]
     }
 
     lassign [R $observer TIME] sec usec
@@ -518,7 +566,7 @@ start_cluster 3 5 {tags {external:skip cluster} overrides {cluster-allow-replica
     test "Empty-shard migration target is auto-updated after a newer config epoch first seen on a handshake link" {
         test_defer_fail { normalize_cluster $shard_pairs }
         # R3 misses both failovers and discards the first PONG of R6 after them
-        failover_and_back_unseen_by 6 7 3 1
+        failover_and_back_unseen_by 6 7 3 handshake
         wait_for_role 6 master
         wait_for_role 7 slave
         # Validate final states
@@ -539,6 +587,74 @@ start_cluster 3 5 {tags {external:skip cluster} overrides {cluster-allow-replica
         wait_for_slot_state 6 "\[609-<-$R0_id\]"
         wait_for_slot_state 3 "\[609->-$R6_id\]"
         wait_for_slot_state 7 "\[609-<-$R0_id\]"
+    }
+    test "Empty-shard migration target is auto-updated after a newer config epoch first seen in a PUBLISH" {
+        test_defer_fail { normalize_cluster $shard_pairs }
+        # R3 misses both failovers and records R6's newer epoch from a PUBLISH
+        failover_and_back_unseen_by 6 7 3 publish
+        wait_for_role 6 master
+        wait_for_role 7 slave
+        # Validate final states
+        wait_for_slot_state 0 "\[609->-$R6_id\]"
+        wait_for_slot_state 6 "\[609-<-$R0_id\]"
+        wait_for_slot_state 7 "\[609-<-$R0_id\]"
+        wait_for_slot_state 3 "\[609->-$R6_id\]"
+    }
+
+    test "Empty-shard migration target follows a takeover by a node last seen as the primary of another shard" {
+        test_defer_fail { normalize_cluster $shard_pairs }
+        # An earlier failing test may have left R3 on another target.
+        if {[get_open_slots 3] ne "\[609->-$R6_id\]"} {
+            assert_equal {OK} [R 0 CLUSTER SETSLOT 609 MIGRATING $R6_id]
+        }
+        wait_for_slot_state 0 "\[609->-$R6_id\]"
+        wait_for_slot_state 3 "\[609->-$R6_id\]"
+        # R7 leaves for its own empty shard, and R3 sees it there as a primary.
+        assert_equal {OK} [R 7 CLUSTER RESET]
+        assert_equal {OK} [R 7 CLUSTER MEET [srv 0 host] [srv 0 port]]
+        set R7_old_shard [R 7 CLUSTER MYSHARDID]
+        wait_for_condition 200 100 {
+            [catch {cluster_get_node_by_id 3 $R7_id} n] == 0 && $n ne {} &&
+            [cluster_has_flag $n master] && [node_shard_id 3 $R7_id] eq $R7_old_shard
+        } else {
+            fail "R3 never saw R7 as a primary of its own shard"
+        }
+        wait_for_condition 200 100 {
+            [catch {cluster_get_node_by_id 7 $R6_id} n] == 0 && $n ne {}
+        } else {
+            fail "R7 never learned R6"
+        }
+        assert_equal "\[609->-$R6_id\]" [get_open_slots 3]
+        # R3 misses R7 joining R6's shard and taking it over, so the first
+        # packet with R7's newer epoch also carries its new shard id.
+        R 3 DEBUG DROP-CLUSTER-PACKET-FILTER -2
+        assert_equal {OK} [R 7 CLUSTER REPLICATE $R6_id]
+        wait_for_role 7 slave
+        set shard [R 6 CLUSTER MYSHARDID]
+        pause_process [srv -6 pid]
+        assert_equal {OK} [R 7 CLUSTER FAILOVER TAKEOVER]
+        wait_for_condition 100 100 {
+            [get_cluster_role 7] eq "master"
+        } else {
+            fail "R7 did not take over"
+        }
+        set e7 [dict get [cluster_get_myself 7] config_epoch]
+        wait_for_condition 100 100 {
+            [dict get [cluster_get_node_by_id 0 $R7_id] config_epoch] == $e7
+        } else {
+            fail "R0 did not see R7 take over"
+        }
+        wait_for_slot_state 0 "\[609->-$R7_id\]"
+        # R6 is paused, so R3 hears from R7 first.
+        R 3 DEBUG DROP-CLUSTER-PACKET-FILTER -1
+        wait_for_condition 300 100 {
+            [dict get [cluster_get_node_by_id 3 $R7_id] config_epoch] == $e7 &&
+            [node_shard_id 3 $R7_id] eq $shard
+        } else {
+            fail "R3 did not record R7's takeover"
+        }
+        resume_process [srv -6 pid]
+        wait_for_slot_state 3 "\[609->-$R7_id\]"
     }
 }
 
